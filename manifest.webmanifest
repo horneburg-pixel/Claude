@@ -1,0 +1,12 @@
+{
+  "name": "English for Real Life",
+  "short_name": "English",
+  "description": "Englisch lernen für Urlaub und Alltag",
+  "lang": "de",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#F2F4F8",
+  "theme_color": "#2745A6",
+  "icons": [{ "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }]
+}

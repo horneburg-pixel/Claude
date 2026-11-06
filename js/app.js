@@ -222,15 +222,29 @@
       this.refresh();
     },
     refresh() { this.mode = this.sample ? 'claude' : (lsGet(LS_KEY) ? 'api' : null); },
-    async json(system, user, schema) {
-      if (this.mode === 'claude') return this.viaClaude(system, user, schema);
-      if (this.mode === 'api') return this.viaApi(system, user, schema);
+    /* opts.deep = true: gründlichere Stufe (Abschluss-Feedback). Einzelne Sätze bleiben schnell. */
+    async json(system, user, schema, opts = {}) {
+      if (this.mode === 'claude') return this.viaClaude(system, user, schema, !!opts.deep);
+      if (this.mode === 'api') return this.viaApi(system, user, schema, !!opts.deep);
       throw new AIError('Die KI ist noch nicht eingerichtet. Öffne „Optionen“ und trage deinen API-Key ein.', 'setup');
     },
-    async viaClaude(system, user, schema) {
+    /* Merkt sich, wer zuletzt geantwortet hat (für die Anzeige in Optionen und im Feedback). */
+    remember(info) {
+      const rec = { ...info, at: Date.now() };
+      setUiPref('lastAI', rec);
+      if (info.task === 'feedback') setUiPref('lastAIFeedback', rec);
+      else setUiPref('lastAITurn', rec);
+    },
+    async viaClaude(system, user, schema, deep) {
       const input = `${system}\n\n${user}\n\nAnswer with ONLY one JSON object that matches this JSON schema, no other text:\n${JSON.stringify(schema)}`;
+      const tier = deep ? 'complex' : 'default';
       try {
-        return await this.sample.json(input, { cache: false });
+        const ask = this.sample;
+        const r = await ask(input, { cache: false, modelTier: tier });
+        if (r.truncated) throw Object.assign(new Error('truncated'), { code: 'truncated' });
+        const value = parseJsonText(r.text);
+        this.remember({ mode: 'claude', task: deep ? 'feedback' : 'turn', tierAsked: tier, tier: r.modelTierApplied || tier });
+        return value;
       } catch (e) {
         const code = e && e.code;
         const map = {
@@ -239,18 +253,21 @@
           sampling_disabled: 'Claude ist für diese Seite gerade nicht verfügbar.',
           session_expired: 'Deine Sitzung ist abgelaufen. Bitte lade die Seite neu.',
           refused: 'Claude hat diese Anfrage abgelehnt. Formuliere den Satz bitte anders.',
-          invalid_json: 'Die Antwort war unvollständig. Bitte sende den Satz noch einmal.'
+          invalid_json: 'Die Antwort war unvollständig. Bitte sende den Satz noch einmal.',
+          parse: 'Die Antwort war unvollständig. Bitte sende den Satz noch einmal.',
+          truncated: 'Die Antwort wurde abgeschnitten. Bitte noch einmal senden.'
         };
         throw new AIError(map[code] || 'Die KI hat gerade nicht geantwortet. Bitte versuch es noch einmal.', code || 'error');
       }
     },
-    async viaApi(system, user, schema) {
+    async viaApi(system, user, schema, deep) {
       const key = lsGet(LS_KEY);
       const model = state.settings.model || DEFAULT_SETTINGS.model;
+      const effort = deep ? 'medium' : 'low';
       const body = {
-        model, max_tokens: 4000, system,
+        model, max_tokens: deep ? 8000 : 4000, system,
         messages: [{ role: 'user', content: user }],
-        output_config: { effort: 'low', format: { type: 'json_schema', schema } }
+        output_config: { effort, format: { type: 'json_schema', schema } }
       };
       const headers = {
         'content-type': 'application/json',
@@ -275,9 +292,33 @@
       if (data.stop_reason === 'refusal') throw new AIError('Die KI hat diese Anfrage abgelehnt. Formuliere den Satz bitte anders.', 'refusal');
       if (data.stop_reason === 'max_tokens') throw new AIError('Die Antwort war zu lang und wurde abgeschnitten. Schreib einen kürzeren Satz.', 'max_tokens');
       const text = (data.content || []).filter((b) => b.type === 'text').map((b) => b.text).join('');
-      try { return JSON.parse(text); } catch { throw new AIError('Die Antwort der KI war unlesbar. Bitte noch einmal senden.', 'parse'); }
+      let value;
+      try { value = JSON.parse(text); } catch { throw new AIError('Die Antwort der KI war unlesbar. Bitte noch einmal senden.', 'parse'); }
+      // data.model = das Modell, das wirklich geantwortet hat (bei Ablehnung kann ein Ersatzmodell einspringen).
+      this.remember({ mode: 'api', task: deep ? 'feedback' : 'turn', model: data.model || model, modelAsked: model, effort });
+      return value;
     }
   };
+  function parseJsonText(t) {
+    const s = String(t || '').trim().replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '').trim();
+    try { return JSON.parse(s); } catch { /* weiter unten */ }
+    const a = s.indexOf('{'), b = s.lastIndexOf('}');
+    if (a >= 0 && b > a) { try { return JSON.parse(s.slice(a, b + 1)); } catch { /* unlesbar */ } }
+    throw Object.assign(new Error('parse'), { code: 'parse' });
+  }
+  const MODEL_NAMES = { 'claude-opus-5-5': 'Claude Opus 5.5', 'claude-sonnet-5-5': 'Claude Sonnet 5.5', 'claude-haiku-5-5': 'Claude Haiku 5.5' };
+  const TIER_NAMES = { quick: 'schnell (quick)', default: 'Standard (default)', complex: 'gründlich (complex)' };
+  /* Lesbare Beschreibung, wer geantwortet hat. */
+  function aiLabel(rec) {
+    if (!rec) return '';
+    if (rec.mode === 'claude') {
+      const downgraded = rec.tierAsked && rec.tier && rec.tier !== rec.tierAsked;
+      return `Claude-Konto · Stufe ${TIER_NAMES[rec.tier] || rec.tier}${downgraded ? ` (angefragt: ${TIER_NAMES[rec.tierAsked] || rec.tierAsked}, dein Tarif hat ersetzt)` : ''}`;
+    }
+    const fallback = rec.modelAsked && rec.model && !String(rec.model).startsWith(rec.modelAsked);
+    return `${MODEL_NAMES[rec.model] || rec.model} · Effort ${rec.effort}${fallback ? ` (Ersatz für ${MODEL_NAMES[rec.modelAsked] || rec.modelAsked})` : ''}`;
+  }
+  function uiPrefObj(k) { try { const o = JSON.parse(lsGet(LS_UI) || '{}'); return o[k] || null; } catch { return null; } }
 
   const TURN_SCHEMA = {
     type: 'object', additionalProperties: false,
@@ -525,7 +566,7 @@
         <div class="field"><label for="model">Modell</label><select id="model">${MODELS.map((m) => `<option value="${m.id}" ${state.settings.model === m.id ? 'selected' : ''}>${esc(m.label)}</option>`).join('')}</select>
           <p class="small muted">Kosten werden nach Nutzung abgerechnet. Grobe Schätzung bei 10 Minuten Gespräch pro Tag: Opus 5.5 etwa 5–7 €/Monat, Sonnet 5.5 etwa die Hälfte, Haiku 5.5 deutlich unter 1 €.</p></div>`;
     return `${header('Optionen')}
-      <section class="card stack-lg"><h3>KI-Gesprächspartner</h3>${ai}</section>
+      <section class="card stack-lg"><h3>KI-Gesprächspartner</h3>${ai}${aiStatusHtml()}</section>
       <section class="card stack-lg"><h3>Aussprache</h3>
         <div class="field"><label for="voice">Stimme</label><select id="voice"><option value="">Automatisch (britisch, falls vorhanden)</option></select></div>
         <div class="field"><label for="rate">Sprechtempo: <span id="rate-val">${state.settings.rate.toFixed(2)}</span></label><input id="rate" type="range" min="0.6" max="1.2" step="0.05" value="${state.settings.rate}"></div>
@@ -539,6 +580,16 @@
         <div id="reset-box" class="stack"><button class="btn ghost" data-act="ask-reset">Fortschritt zurücksetzen …</button></div></section>
       <p class="small muted">Inhalte: 12 Einheiten · ${UNITS.reduce((s, u) => s + u.vocab.length, 0)} Wörter · ${UNITS.reduce((s, u) => s + u.phrases.length, 0)} Sätze · ${TENSES.length} Zeitformen · ${SCENARIOS.length} Gesprächsszenarien.</p>`;
   }
+  function aiStatusHtml() {
+    const turn = uiPrefObj('lastAITurn'), fb = uiPrefObj('lastAIFeedback');
+    const planned = AI.mode === 'claude'
+      ? 'Einzelne Sätze: Stufe „default“ (schnell) · Abschluss-Feedback: Stufe „complex“ (gründlich). Das genaue Modell wählt Claude.'
+      : `Einzelne Sätze: ${esc(MODEL_NAMES[state.settings.model] || state.settings.model)}, Effort „low“ · Abschluss-Feedback: Effort „medium“.`;
+    return `<div class="card soft stack"><p class="eyebrow">Was läuft im Hintergrund?</p><p class="small">${planned}</p>
+      <p class="small"><b>Zuletzt bei Sätzen:</b> ${turn ? esc(aiLabel(turn)) + ' · ' + esc(fmtTime(turn.at)) : 'noch keine Anfrage'}</p>
+      <p class="small"><b>Zuletzt beim Feedback:</b> ${fb ? esc(aiLabel(fb)) + ' · ' + esc(fmtTime(fb.at)) : 'noch keine Anfrage'}</p></div>`;
+  }
+  const fmtTime = (t) => new Date(t).toLocaleString('de-DE', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
   function fillVoiceSelect() {
     const sel = $('#voice'); if (!sel) return;
     const fill = () => {
@@ -853,7 +904,7 @@
       this.busy = true; this.draw();
       const sys = 'You are an English teacher for a German native speaker at CEFR level A2 aiming for B1. Analyse the learner\'s English in this role-play conversation. Write all explanations in simple German. focus: the 1 to 3 most important recurring problems, each with a real example from the learner (wrong), the corrected version (right) and a short tip in German. If there were hardly any mistakes, give useful phrases to sound more natural instead. strengths_de: what the learner did well. next_step_de: one concrete exercise suggestion.';
       const user = `Scenario: ${this.sc.title} (${this.sc.place}).\n\n${transcript(this)}`;
-      try { this.summary = await AI.json(sys, user, SUMMARY_SCHEMA); }
+      try { this.summary = await AI.json(sys, user, SUMMARY_SCHEMA, { deep: true }); this.summaryBy = aiLabel(uiPrefObj('lastAIFeedback')); }
       catch (e) { toast(e.message || 'Feedback nicht möglich.'); }
       this.busy = false; this.draw();
     },
@@ -862,7 +913,7 @@
       return `<section class="card stack"><p class="eyebrow">Feedback zum Gespräch</p><p>${esc(s.summary_de)}</p>
         <p><b>Das war gut:</b> ${esc(s.strengths_de)}</p>
         ${(s.focus || []).map((f) => `<div class="card soft stack"><p><b>${esc(f.topic_de)}</b></p>${f.wrong ? `<p class="small"><span class="del">${esc(f.wrong)}</span></p>` : ''}<p><b>${esc(f.right)}</b></p><p class="small">${esc(f.tip_de)}</p></div>`).join('')}
-        <p><b>Nächster Schritt:</b> ${esc(s.next_step_de)}</p></section>`;
+        <p><b>Nächster Schritt:</b> ${esc(s.next_step_de)}</p>${this.summaryBy ? `<p class="small muted">Erstellt von: ${esc(this.summaryBy)}</p>` : ''}</section>`;
     },
     async mic() {
       if (this.listening) { Speech.stop(); return; }
@@ -935,7 +986,7 @@
         el.disabled = true; el.textContent = 'Teste …';
         try {
           const r = await AI.json('You check English sentences. Reply in JSON.', 'Is "I am here since Monday" correct English? Give the corrected sentence.', { type: 'object', additionalProperties: false, required: ['corrected'], properties: { corrected: { type: 'string' } } });
-          toast('Funktioniert: „' + r.corrected + '“');
+          toast('Funktioniert (' + aiLabel(uiPrefObj('lastAI')) + '): „' + r.corrected + '“'); render();
         } catch (err) { toast(err.message); }
         el.disabled = false; el.textContent = 'Testen'; break;
       }
